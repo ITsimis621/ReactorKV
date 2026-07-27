@@ -1,0 +1,396 @@
+#include "Server.h"
+#include "Logger.h"
+#include "Connection.h"
+
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
+
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <iostream>
+#include <cerrno>
+#include <string>
+#include <cstdlib>
+#include <memory>
+
+constexpr int BUFFER_SIZE = 4096;
+constexpr int THREAD_POOL_SIZE = 10; 
+constexpr size_t MAX_PAYLOAD_SIZE = 8388608;
+
+Server::Server(int port, KVStore& db, int timeout_sec) 
+    : port(port), db(db), server_socket(-1), client_timeout_sec(timeout_sec), stop_pool(false) {
+    
+    std::cout << format_log("INFO", "SYSTEM", "Initializing Database Engine on Port " + std::to_string(port) + "...") << std::endl;
+
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_socket == -1) {
+        std::cerr << format_log("FATAL", "SYSTEM", "Failed to create socket") << std::endl;
+        exit(1); 
+    }
+
+    int opt = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in server_address;
+    server_address.sin_family = AF_INET;
+    server_address.sin_addr.s_addr = INADDR_ANY;
+    server_address.sin_port = htons(port);
+
+    if (bind(server_socket, (struct sockaddr*)&server_address, sizeof(server_address)) < 0) {
+        std::cerr << format_log("FATAL", "SYSTEM", "Bind failed on port " + std::to_string(port)) << std::endl;
+        exit(1);
+    }
+
+    if (listen(server_socket, 50) < 0) {
+        std::cerr << format_log("FATAL", "SYSTEM", "Listen failed.") << std::endl;
+        exit(1);
+    }
+
+    // Reserve a file descriptor to handle graceful EMFILE/ENFILE descriptor exhaustion
+    idle_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (idle_fd == -1) {
+        std::cerr << format_log("FATAL", "SYSTEM", "Failed to open reserve file descriptor.") << std::endl;
+        exit(1);
+    }
+
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        std::cerr << format_log("FATAL", "SYSTEM", "Failed to create epoll file descriptor.") << std::endl;
+        exit(1);
+    }
+
+    set_non_blocking(server_socket);
+
+    struct epoll_event event;
+    event.events = EPOLLIN; 
+    event.data.fd = server_socket;
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_socket, &event) == -1) {
+        std::cerr << format_log("FATAL", "SYSTEM", "Failed to add server socket to epoll.") << std::endl;
+        exit(1);
+    }
+
+    for (int i = 0; i < THREAD_POOL_SIZE; ++i) {
+        thread_pool.emplace_back(&Server::worker_thread, this);
+    }
+    std::cout << format_log("INFO", "SYSTEM", "Thread pool initialized with " + std::to_string(THREAD_POOL_SIZE) + " workers.") << std::endl;
+}
+
+Server::~Server() {
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        stop_pool = true;
+    }
+    
+    condition.notify_all();
+
+    for (std::thread& worker : thread_pool) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    if (server_socket != -1) close(server_socket);
+    if (idle_fd != -1) close(idle_fd);
+}
+
+void Server::start(std::atomic<bool>& keep_running) {
+    std::cout << format_log("INFO", "SYSTEM", "Server actively listening (epoll mode). Awaiting connections...") << std::endl;
+
+    struct epoll_event events[MAX_EVENTS];
+
+    while (keep_running) {
+        int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+
+        if (num_events == -1) {
+            if (errno == EINTR) continue; 
+            std::cerr << format_log("ERROR", "SYSTEM", "epoll_wait failed.") << std::endl;
+            break; 
+        }
+
+        static auto last_sweep = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_sweep).count() >= 1) {
+            sweep_idle_clients(); 
+            last_sweep = now;
+        }
+
+        for (int i = 0; i < num_events; ++i) {
+            int ready_fd = events[i].data.fd;
+
+            if (ready_fd == server_socket) {
+                while (true) {
+                    int client_socket = accept(server_socket, nullptr, nullptr);
+                    
+                    if (client_socket < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+
+                        // EMFILE/ENFILE mitigation: clear the OS accept queue using the reserve descriptor
+                        if (errno == EMFILE || errno == ENFILE) {
+                            std::cerr << format_log("ERROR", "NETWORK", "Maximum open files reached. Dropping connection to prevent busy-loop.") << std::endl;
+                            close(idle_fd);
+                            int temp_socket = accept(server_socket, nullptr, nullptr);
+                            if (temp_socket >= 0) close(temp_socket);
+                            idle_fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+                            break;
+                        }
+                        break; 
+                    }
+
+                    set_non_blocking(client_socket);
+
+                    {
+                        std::lock_guard<std::mutex> lock(connections_mutex);
+                        active_connections[client_socket] = std::make_shared<Connection>(client_socket);
+                    }
+
+                    struct epoll_event client_event;
+                    client_event.events = EPOLLIN | EPOLLONESHOT;
+                    client_event.data.fd = client_socket;
+
+                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket, &client_event);
+                }
+            }
+            else {
+                int fd = events[i].data.fd;
+                std::lock_guard<std::mutex> conn_lock(connections_mutex);
+                auto it = active_connections.find(fd);
+                
+                if (it != active_connections.end()) {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    // Pass the epoll event flag alongside the connection for smart task routing
+                    client_queue.push({it->second, static_cast<uint32_t>(events[i].events)});
+                    condition.notify_one(); 
+                }
+            }
+        }
+    }
+
+    std::cout << format_log("INFO", "SYSTEM", "Shutdown signal received. Closing server...") << std::endl;
+}
+
+bool Server::set_non_blocking(int socket_fd) {
+    int flags = fcntl(socket_fd, F_GETFL, 0);
+    if (flags == -1) return false;
+    flags |= O_NONBLOCK;
+    if (fcntl(socket_fd, F_SETFL, flags) == -1) return false;
+    return true;
+}
+
+void Server::sweep_idle_clients() {
+    uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+        
+    std::lock_guard<std::mutex> lock(connections_mutex);
+
+    for (auto it = active_connections.begin(); it != active_connections.end(); ) {
+        auto& conn = it->second;
+
+        // Lock-free read of the atomic timestamp prevents thread serialization
+        uint64_t last_active = conn->last_active.load(std::memory_order_relaxed);
+
+        if (now - last_active > static_cast<uint64_t>(client_timeout_sec)) {
+            // Only evict if the connection is exclusively held by the map
+            if (conn.use_count() == 1) {
+                std::cout << format_log("INFO", "NETWORK", "Client timed out. Dropping connection.") << std::endl;
+                it = active_connections.erase(it); // Destructor automatically closes fd
+                continue;
+            }
+        }
+        ++it;
+    }
+}
+
+void Server::safe_remove_connection(std::shared_ptr<Connection> conn) {
+    std::lock_guard<std::mutex> lock(connections_mutex);
+    auto it = active_connections.find(conn->fd);
+    
+    if (it != active_connections.end() && it->second.get() == conn.get()) {
+        active_connections.erase(it);
+    }
+}
+
+void Server::worker_thread() {
+    while (true) {
+        std::shared_ptr<Connection> conn = nullptr; 
+        uint32_t event_flags = 0;
+        
+        { 
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            condition.wait(lock, [this] { return stop_pool || !client_queue.empty(); });
+            
+            if (stop_pool && client_queue.empty()) return;
+            
+            auto task = client_queue.front();
+            conn = task.first;
+            event_flags = task.second;
+            client_queue.pop();
+        } 
+        
+        handle_client(conn, event_flags);
+    }
+}
+
+void Server::handle_client(std::shared_ptr<Connection> conn, uint32_t event_flags) {
+
+    // Only attempt I/O reads if epoll explicitly signaled incoming data
+    if (event_flags & EPOLLIN) {
+        char temp[BUFFER_SIZE]; 
+
+        while (true) {
+            ssize_t bytes_read = read(conn->fd, temp, sizeof(temp));
+            
+            if (bytes_read > 0) {
+                conn->read_buffer.append(temp, bytes_read);
+                // Update atomic timestamp without acquiring global locks
+                conn->last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
+            } 
+            else if (bytes_read == 0) {
+                safe_remove_connection(conn);
+                return;
+            } 
+            else {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break; 
+                } 
+                else if (errno == EINTR) {
+                    continue; 
+                } 
+                else {
+                    std::cerr << format_log("WARN", "NETWORK", "Client socket error. Dropping connection.") << std::endl;
+                    safe_remove_connection(conn);
+                    return;
+                }
+            }
+        }
+
+        // Memory limit protection against malicious unbounded payloads
+        if (conn->read_buffer.size() > MAX_PAYLOAD_SIZE) {
+            std::cerr << format_log("ERROR", "SECURITY", "Client breached memory limit. Terminating connection.") << std::endl;
+            
+            json error_json;
+            error_json["status"] = "FATAL";
+            error_json["message"] = "Payload Too Large. Maximum allowed size is 8MB.";
+            std::string response = error_json.dump() + "\n";
+            
+            send(conn->fd, response.c_str(), response.length(), MSG_NOSIGNAL);
+            
+            safe_remove_connection(conn);
+            return;
+        }
+
+        size_t parse_offset = 0;
+        size_t pos;
+
+        // O(1) sliding offset parsing eliminates redundant string memory shifts
+        while ((pos = conn->read_buffer.find('\n', parse_offset)) != std::string::npos) {
+            std::string raw_message = conn->read_buffer.substr(parse_offset, pos - parse_offset);
+            parse_offset = pos + 1; 
+            
+            json response_json;
+            try {
+                json request = json::parse(raw_message);
+                std::cout << format_log("INFO", "NETWORK", "Received client payload: " + request.dump()) << std::endl;
+                
+                std::string command = request.value("command", "");
+
+                if (command == "SET") {
+                    std::string key = request.value("key", "");
+                    std::string value = request.value("value", "");
+
+                    if (key.empty()) {
+                        response_json["status"] = "ERROR";
+                        response_json["message"] = "Missing or empty 'key' field.";
+                    } else {
+                        db.set(key, value);
+                        response_json["status"] = "SUCCESS";
+                        response_json["message"] = "Key saved.";
+                    }
+                } 
+                else if (command == "GET") {
+                    std::string key = request.value("key", "");
+                    
+                    if (key.empty()) {
+                        response_json["status"] = "ERROR";
+                        response_json["message"] = "Missing or empty 'key' field.";
+                    } else {
+                        response_json["status"] = "SUCCESS";
+                        response_json["data"] = db.get(key);
+                    }
+                }
+                else if (command == "REMOVE") {
+                    std::string key = request.value("key", "");
+                    
+                    if (key.empty()) {
+                        response_json["status"] = "ERROR";
+                        response_json["message"] = "Missing or empty 'key' field.";
+                    } else {
+                        db.remove(key);
+                        response_json["status"] = "SUCCESS";
+                        response_json["message"] = "Key removed.";
+                    }
+                }
+                else {
+                    response_json["status"] = "ERROR";
+                    response_json["message"] = "Unknown or missing command.";
+                }
+            } catch (const json::parse_error& e) {
+                response_json["status"] = "ERROR";
+                response_json["message"] = "Invalid JSON payload format.";
+                std::cerr << format_log("WARN", "SYSTEM", "Received malformed JSON from client.") << std::endl;
+            }
+
+            conn->write_buffer += response_json.dump() + "\n";
+        }
+
+        // Single O(N) erase call per wakeup cycle
+        if (parse_offset > 0) {
+            conn->read_buffer.erase(0, parse_offset);
+        }
+    }
+
+    // Bypass read loop and jump straight to flushing if OS TCP buffer just drained (EPOLLOUT)
+    if ((event_flags & EPOLLOUT) || !conn->write_buffer.empty()) {
+        ssize_t total_sent = 0;
+        
+        while (total_sent < static_cast<ssize_t>(conn->write_buffer.length())) {
+            ssize_t bytes_sent = send(conn->fd, conn->write_buffer.c_str() + total_sent, 
+                                    conn->write_buffer.length() - total_sent, MSG_NOSIGNAL);
+            
+            if (bytes_sent == -1) {
+                if (errno == EINTR) continue; 
+                
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break; 
+                }
+
+                std::cerr << format_log("WARN", "NETWORK", "Client disconnected during write.") << std::endl;
+                safe_remove_connection(conn);
+                return; 
+            }
+            total_sent += bytes_sent;
+        }
+
+        if (total_sent > 0) {
+            conn->write_buffer.erase(0, total_sent);
+            conn->last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
+        }
+    }
+
+    struct epoll_event event;
+    
+    if (!conn->write_buffer.empty()) {
+        // Buffer is full (EAGAIN hit). Re-arm with EPOLLOUT to wait for OS TCP buffer to drain.
+        event.events = EPOLLIN | EPOLLOUT | EPOLLONESHOT;
+    } else {
+        event.events = EPOLLIN | EPOLLONESHOT;
+    }
+    
+    event.data.fd = conn->fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &event);
+}
