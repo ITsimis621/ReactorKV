@@ -184,23 +184,27 @@ void Server::sweep_idle_clients() {
     uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
         
-    std::lock_guard<std::mutex> lock(connections_mutex);
+    std::vector<std::shared_ptr<Connection>> to_evict;
 
-    for (auto it = active_connections.begin(); it != active_connections.end(); ) {
-        auto& conn = it->second;
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex);
 
-        // Lock-free read of the atomic timestamp prevents thread serialization
-        uint64_t last_active = conn->last_active.load(std::memory_order_relaxed);
+        for (auto it = active_connections.begin(); it != active_connections.end(); ) {
+            auto& conn = it->second;
+            uint64_t last_active = conn->last_active.load(std::memory_order_relaxed);
 
-        if (now - last_active > static_cast<uint64_t>(client_timeout_sec)) {
-            // Only evict if the connection is exclusively held by the map
-            if (conn.use_count() == 1) {
-                std::cout << format_log("INFO", "NETWORK", "Client timed out. Dropping connection.") << std::endl;
-                it = active_connections.erase(it); // Destructor automatically closes fd
-                continue;
+            if (now - last_active > static_cast<uint64_t>(client_timeout_sec) && conn.use_count() == 1) {
+                to_evict.push_back(conn);
+                it = active_connections.erase(it);
+            } else {
+                ++it;
             }
         }
-        ++it;
+    }
+
+    // Lock-free logging and system calls
+    for (auto& conn : to_evict) {
+        std::cout << format_log("INFO", "NETWORK", "Client on FD " + std::to_string(conn->fd) + " timed out. Dropping connection.") << std::endl;
     }
 }
 
@@ -248,7 +252,21 @@ void Server::handle_client(std::shared_ptr<Connection> conn, uint32_t event_flag
                 // Update atomic timestamp without acquiring global locks
                 conn->last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
-            } 
+
+                if (conn->read_buffer.size() > MAX_PAYLOAD_SIZE) {
+                    std::cerr << format_log("ERROR", "SECURITY", "Client breached memory limit. Terminating connection.") << std::endl;
+                    
+                    json error_json;
+                    error_json["status"] = "FATAL";
+                    error_json["message"] = "Payload Too Large. Maximum allowed size is 8MB.";
+                    std::string response = error_json.dump() + "\n";
+                    
+                    send(conn->fd, response.c_str(), response.length(), MSG_NOSIGNAL);
+                    
+                    safe_remove_connection(conn);
+                    return;
+                }
+            }
             else if (bytes_read == 0) {
                 safe_remove_connection(conn);
                 return;
@@ -266,21 +284,6 @@ void Server::handle_client(std::shared_ptr<Connection> conn, uint32_t event_flag
                     return;
                 }
             }
-        }
-
-        // Memory limit protection against malicious unbounded payloads
-        if (conn->read_buffer.size() > MAX_PAYLOAD_SIZE) {
-            std::cerr << format_log("ERROR", "SECURITY", "Client breached memory limit. Terminating connection.") << std::endl;
-            
-            json error_json;
-            error_json["status"] = "FATAL";
-            error_json["message"] = "Payload Too Large. Maximum allowed size is 8MB.";
-            std::string response = error_json.dump() + "\n";
-            
-            send(conn->fd, response.c_str(), response.length(), MSG_NOSIGNAL);
-            
-            safe_remove_connection(conn);
-            return;
         }
 
         size_t parse_offset = 0;

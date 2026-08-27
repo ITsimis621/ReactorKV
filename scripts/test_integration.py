@@ -242,7 +242,11 @@ class TestReactorKVIntegration(unittest.TestCase):
             s.connect((HOST, PORT))
             
             massive_string = "A" * 9_000_000 
-            s.sendall(massive_string.encode('utf-8'))
+            try:
+                s.sendall(massive_string.encode('utf-8'))
+            except (BrokenPipeError, ConnectionResetError):
+                # This is an acceptable outcome: the server slammed the door mid-stream.
+                pass
             
             response = s.recv(1024).decode('utf-8')
             
