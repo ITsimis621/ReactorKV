@@ -2,7 +2,7 @@
 
 /**
  * @file Connection.h
- * @brief Connection state management for the server.
+ * @brief Lock-free connection state management for the server's Object Pool.
  */
 
 #include <string>
@@ -14,34 +14,42 @@
  * @struct Connection
  * @brief Encapsulates all state for a single connected TCP client.
  * 
- * Maintains I/O buffers and lock-free metadata required for 
- * asynchronous event-driven network processing.
+ * Designed to live permanently inside a statically allocated std::array.
+ * Uses atomic flags for lock-free state tracking and avoids dynamic 
+ * memory allocation during client connect/disconnect cycles.
  */
 struct Connection {
-    int fd;                                            ///< The client's socket file descriptor
-    std::string read_buffer;                           ///< Unprocessed incoming TCP stream data
-    std::string write_buffer;                          ///< Queued outbound JSON responses
-    std::atomic<uint64_t> last_active;                 ///< Lock-free epoch timestamp for idle eviction
+    int fd{-1};                                ///< The client's socket file descriptor
+    std::string read_buffer;                   ///< Unprocessed incoming TCP stream data
+    std::string write_buffer;                  ///< Queued outbound JSON responses
+    std::atomic<uint64_t> last_active{0};      ///< Epoch timestamp for idle eviction
+    std::atomic<bool> is_active{false};        ///< Lock-free flag indicating if slot is in use
+    std::atomic<uint64_t> generation{0};       ///< ABA prevention counter to track connection lifecycles
 
     /**
-     * @brief Initializes a new client connection.
-     * @param socket_fd The accepted socket file descriptor.
+     * @brief Default constructor required for std::array pre-allocation.
      */
-    explicit Connection(int socket_fd) 
-        : fd(socket_fd) {
-        last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
-    }
+    Connection() = default;
     
+    // NOTE: No RAII Destructor! The object pool owns the memory permanently.
+    // Socket cleanup is handled explicitly via the reset() method.
+
     /**
-     * @brief RAII Destructor.
+     * @brief Wipes the connection state, preparing the slot for the next client.
      * 
-     * Guarantees the OS socket is cleanly closed when the connection 
-     * is evicted or the server shuts down, preventing descriptor leaks.
+     * Closes the OS socket and logically clears strings (size = 0) 
+     * while retaining their underlying heap capacity for ultra-fast reuse.
      */
-    ~Connection() {
+    void reset() {
         if (fd != -1) {
             close(fd);
+            fd = -1;
         }
+        
+        // .clear() does not deallocate memory, achieving O(1) resets
+        read_buffer.clear();
+        write_buffer.clear();
+        last_active.store(0, std::memory_order_relaxed);
+        is_active.store(false, std::memory_order_relaxed);
     }
 };

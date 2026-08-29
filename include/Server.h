@@ -7,20 +7,21 @@
  * Utilizes Linux epoll for non-blocking event multiplexing (Reactor) 
  * and a fixed-size thread pool for parallel request processing (Workers), enabling 
  * high-throughput, highly concurrent database access. Memory is safely managed
- * across threads via shared ownership (std::shared_ptr).
+ * across threads via a static Object Pool and generational indexing.
  */
 
 #include "KVStore.h"
 #include "Connection.h"
 #include <atomic>
-#include <memory>
 #include <vector>
-#include <unordered_map>
+#include <tuple>
 #include <queue>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <sys/epoll.h>
+
+constexpr int MAX_CONNECTIONS = 10000;
 
 /**
  * @class Server
@@ -42,18 +43,8 @@ private:
     std::condition_variable condition;      ///< Signals workers when jobs are available or shutting down
     bool stop_pool;                         ///< Flag to safely terminate all worker threads
 
-    std::queue<std::pair<std::shared_ptr<Connection>, uint32_t>> client_queue;  ///< Pending jobs representing sockets ready for I/O
-    std::unordered_map<int, std::shared_ptr<Connection>> active_connections;    ///< Shared memory ownership of active clients
-    std::mutex connections_mutex;           ///< Protects the active connections map
-
-    /**
-     * @brief Safely removes a connection from the active map.
-     * 
-     * Performs an identity check to prevent iterator invalidation and guard 
-     * against Linux file descriptor recycling race conditions.
-     * @param conn Shared pointer to the connection being removed.
-     */
-    void safe_remove_connection(std::shared_ptr<Connection> conn);
+    std::queue<std::tuple<int, uint64_t, uint32_t>> client_queue;          ///< Pending jobs representing sockets ready for I/O
+    std::array<Connection, MAX_CONNECTIONS> connection_pool;               ///< Statically allocated memory pool for client connections
 
     /**
      * @brief Sets a socket file descriptor to non-blocking mode.
@@ -74,10 +65,10 @@ private:
 
     /**
      * @brief Parses JSON, executes DB operations, and buffers responses.
-     * @param conn Shared pointer to the active connection state.
+     * @param conn Reference to the active connection state.
      * @param event_flags The epoll bitmask triggering the wakeup (EPOLLIN/EPOLLOUT).
      */
-    void handle_client(std::shared_ptr<Connection> conn, uint32_t event_flags);
+    void handle_client(Connection& conn, uint32_t event_flags);
 
 public:
     /**

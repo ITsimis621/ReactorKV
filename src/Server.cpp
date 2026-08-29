@@ -14,7 +14,6 @@ using json = nlohmann::json;
 #include <cerrno>
 #include <string>
 #include <cstdlib>
-#include <memory>
 
 constexpr int BUFFER_SIZE = 4096;
 constexpr int THREAD_POOL_SIZE = 10; 
@@ -140,12 +139,20 @@ void Server::start(std::atomic<bool>& keep_running) {
                         break; 
                     }
 
+                    if (client_socket >= MAX_CONNECTIONS) {
+                        std::cerr << format_log("ERROR", "NETWORK", "FD exceeds maximum pool capacity! Dropping.") << std::endl;
+                        close(client_socket);
+                        continue;
+                    }
+
                     set_non_blocking(client_socket);
 
-                    {
-                        std::lock_guard<std::mutex> lock(connections_mutex);
-                        active_connections[client_socket] = std::make_shared<Connection>(client_socket);
-                    }
+                    Connection& conn = connection_pool[client_socket];
+                    conn.fd = client_socket;
+                    conn.generation.fetch_add(1, std::memory_order_relaxed);
+                    conn.is_active.store(true, std::memory_order_relaxed);
+                    conn.last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
 
                     struct epoll_event client_event;
                     client_event.events = EPOLLIN | EPOLLONESHOT;
@@ -156,14 +163,14 @@ void Server::start(std::atomic<bool>& keep_running) {
             }
             else {
                 int fd = events[i].data.fd;
-                std::lock_guard<std::mutex> conn_lock(connections_mutex);
-                auto it = active_connections.find(fd);
-                
-                if (it != active_connections.end()) {
-                    std::lock_guard<std::mutex> lock(queue_mutex);
-                    // Pass the epoll event flag alongside the connection for smart task routing
-                    client_queue.push({it->second, static_cast<uint32_t>(events[i].events)});
-                    condition.notify_one(); 
+                if (connection_pool[fd].is_active.load(std::memory_order_relaxed)) {
+                        std::lock_guard<std::mutex> lock(queue_mutex);
+                        client_queue.push({
+                            fd,
+                            connection_pool[fd].generation.load(std::memory_order_relaxed),
+                            static_cast<uint32_t>(events[i].events)
+                        });
+                        condition.notify_one(); 
                 }
             }
         }
@@ -184,42 +191,26 @@ void Server::sweep_idle_clients() {
     uint64_t now = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
         
-    std::vector<std::shared_ptr<Connection>> to_evict;
-
-    {
-        std::lock_guard<std::mutex> lock(connections_mutex);
-
-        for (auto it = active_connections.begin(); it != active_connections.end(); ) {
-            auto& conn = it->second;
-            uint64_t last_active = conn->last_active.load(std::memory_order_relaxed);
-
-            if (now - last_active > static_cast<uint64_t>(client_timeout_sec) && conn.use_count() == 1) {
-                to_evict.push_back(conn);
-                it = active_connections.erase(it);
-            } else {
-                ++it;
+    for (int i = 0; i < MAX_CONNECTIONS; ++i) {
+        Connection& conn = connection_pool[i];
+        
+        if (conn.is_active.load(std::memory_order_relaxed)) {
+            uint64_t last_active = conn.last_active.load(std::memory_order_relaxed);
+            
+            if (now - last_active > static_cast<uint64_t>(client_timeout_sec)) {
+                std::cout << format_log("INFO", "NETWORK", 
+                    "Client on FD " + std::to_string(conn.fd) + " timed out. Dropping connection.") << std::endl;
+                
+                conn.reset(); 
             }
         }
-    }
-
-    // Lock-free logging and system calls
-    for (auto& conn : to_evict) {
-        std::cout << format_log("INFO", "NETWORK", "Client on FD " + std::to_string(conn->fd) + " timed out. Dropping connection.") << std::endl;
-    }
-}
-
-void Server::safe_remove_connection(std::shared_ptr<Connection> conn) {
-    std::lock_guard<std::mutex> lock(connections_mutex);
-    auto it = active_connections.find(conn->fd);
-    
-    if (it != active_connections.end() && it->second.get() == conn.get()) {
-        active_connections.erase(it);
     }
 }
 
 void Server::worker_thread() {
     while (true) {
-        std::shared_ptr<Connection> conn = nullptr; 
+        int fd = -1;
+        uint64_t task_generation = 0;
         uint32_t event_flags = 0;
         
         { 
@@ -229,31 +220,38 @@ void Server::worker_thread() {
             if (stop_pool && client_queue.empty()) return;
             
             auto task = client_queue.front();
-            conn = task.first;
-            event_flags = task.second;
+            fd = std::get<0>(task);
+            task_generation = std::get<1>(task);
+            event_flags = std::get<2>(task);
             client_queue.pop();
         } 
         
-        handle_client(conn, event_flags);
+        Connection& conn = connection_pool[fd];
+
+        if (conn.is_active.load(std::memory_order_relaxed) &&
+            conn.generation.load(std::memory_order_relaxed) == task_generation) { 
+
+            handle_client(conn, event_flags);
+        }
     }
 }
 
-void Server::handle_client(std::shared_ptr<Connection> conn, uint32_t event_flags) {
+void Server::handle_client(Connection& conn, uint32_t event_flags) {
 
     // Only attempt I/O reads if epoll explicitly signaled incoming data
     if (event_flags & EPOLLIN) {
         char temp[BUFFER_SIZE]; 
 
         while (true) {
-            ssize_t bytes_read = read(conn->fd, temp, sizeof(temp));
+            ssize_t bytes_read = read(conn.fd, temp, sizeof(temp));
             
             if (bytes_read > 0) {
-                conn->read_buffer.append(temp, bytes_read);
+                conn.read_buffer.append(temp, bytes_read);
                 // Update atomic timestamp without acquiring global locks
-                conn->last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
+                conn.last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
 
-                if (conn->read_buffer.size() > MAX_PAYLOAD_SIZE) {
+                if (conn.read_buffer.size() > MAX_PAYLOAD_SIZE) {
                     std::cerr << format_log("ERROR", "SECURITY", "Client breached memory limit. Terminating connection.") << std::endl;
                     
                     json error_json;
@@ -261,14 +259,14 @@ void Server::handle_client(std::shared_ptr<Connection> conn, uint32_t event_flag
                     error_json["message"] = "Payload Too Large. Maximum allowed size is 8MB.";
                     std::string response = error_json.dump() + "\n";
                     
-                    send(conn->fd, response.c_str(), response.length(), MSG_NOSIGNAL);
+                    send(conn.fd, response.c_str(), response.length(), MSG_NOSIGNAL);
                     
-                    safe_remove_connection(conn);
+                    conn.reset();
                     return;
                 }
             }
             else if (bytes_read == 0) {
-                safe_remove_connection(conn);
+                conn.reset();
                 return;
             } 
             else {
@@ -280,7 +278,7 @@ void Server::handle_client(std::shared_ptr<Connection> conn, uint32_t event_flag
                 } 
                 else {
                     std::cerr << format_log("WARN", "NETWORK", "Client socket error. Dropping connection.") << std::endl;
-                    safe_remove_connection(conn);
+                    conn.reset();
                     return;
                 }
             }
@@ -289,9 +287,8 @@ void Server::handle_client(std::shared_ptr<Connection> conn, uint32_t event_flag
         size_t parse_offset = 0;
         size_t pos;
 
-        // O(1) sliding offset parsing eliminates redundant string memory shifts
-        while ((pos = conn->read_buffer.find('\n', parse_offset)) != std::string::npos) {
-            std::string raw_message = conn->read_buffer.substr(parse_offset, pos - parse_offset);
+        while ((pos = conn.read_buffer.find('\n', parse_offset)) != std::string::npos) {
+            std::string raw_message = conn.read_buffer.substr(parse_offset, pos - parse_offset);
             parse_offset = pos + 1; 
             
             json response_json;
@@ -347,22 +344,21 @@ void Server::handle_client(std::shared_ptr<Connection> conn, uint32_t event_flag
                 std::cerr << format_log("WARN", "SYSTEM", "Received malformed JSON from client.") << std::endl;
             }
 
-            conn->write_buffer += response_json.dump() + "\n";
+            conn.write_buffer += response_json.dump() + "\n";
         }
 
-        // Single O(N) erase call per wakeup cycle
         if (parse_offset > 0) {
-            conn->read_buffer.erase(0, parse_offset);
+            conn.read_buffer.erase(0, parse_offset);
         }
     }
 
     // Bypass read loop and jump straight to flushing if OS TCP buffer just drained (EPOLLOUT)
-    if ((event_flags & EPOLLOUT) || !conn->write_buffer.empty()) {
+    if ((event_flags & EPOLLOUT) || !conn.write_buffer.empty()) {
         ssize_t total_sent = 0;
         
-        while (total_sent < static_cast<ssize_t>(conn->write_buffer.length())) {
-            ssize_t bytes_sent = send(conn->fd, conn->write_buffer.c_str() + total_sent, 
-                                    conn->write_buffer.length() - total_sent, MSG_NOSIGNAL);
+        while (total_sent < static_cast<ssize_t>(conn.write_buffer.length())) {
+            ssize_t bytes_sent = send(conn.fd, conn.write_buffer.c_str() + total_sent, 
+                                    conn.write_buffer.length() - total_sent, MSG_NOSIGNAL);
             
             if (bytes_sent == -1) {
                 if (errno == EINTR) continue; 
@@ -372,28 +368,28 @@ void Server::handle_client(std::shared_ptr<Connection> conn, uint32_t event_flag
                 }
 
                 std::cerr << format_log("WARN", "NETWORK", "Client disconnected during write.") << std::endl;
-                safe_remove_connection(conn);
+                conn.reset();
                 return; 
             }
             total_sent += bytes_sent;
         }
 
         if (total_sent > 0) {
-            conn->write_buffer.erase(0, total_sent);
-            conn->last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
+            conn.write_buffer.erase(0, total_sent);
+            conn.last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
         }
     }
 
     struct epoll_event event;
     
-    if (!conn->write_buffer.empty()) {
+    if (!conn.write_buffer.empty()) {
         // Buffer is full (EAGAIN hit). Re-arm with EPOLLOUT to wait for OS TCP buffer to drain.
         event.events = EPOLLIN | EPOLLOUT | EPOLLONESHOT;
     } else {
         event.events = EPOLLIN | EPOLLONESHOT;
     }
     
-    event.data.fd = conn->fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &event);
+    event.data.fd = conn.fd;
+    epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn.fd, &event);
 }

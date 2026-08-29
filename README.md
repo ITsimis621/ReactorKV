@@ -1,5 +1,5 @@
 # ReactorKV
-**Version: 0.6.1**
+**Version: 0.7.0-alpha.1**
 
 A highly concurrent, multithreaded in-memory key-value database written in modern C++17. Built from scratch to demonstrate low-level Linux system programming, this database features a Reactor/Worker network architecture, lock-striped memory partitions, and background asynchronous disk persistence.
 
@@ -14,6 +14,7 @@ A highly concurrent, multithreaded in-memory key-value database written in moder
 
 **Network & Concurrency (The Server)**
 *   **Reactor/Worker Concurrency Model:** Utilizes Linux `epoll` for non-blocking event multiplexing (Reactor) paired with a fixed-size Thread Pool (Workers) to handle thousands of concurrent TCP connections.
+*   **Bare-Metal Object Pool:** Completely eliminates dynamic heap memory allocations (std::shared_ptr) and global mutexes from the critical networking path. Connections are managed via a pre-allocated, contiguous lock-free array, utilizing Generational Indexing (atomic counters) to inherently prevent ABA (socket recycling) race conditions and guarantee deterministic nanosecond task routing.
 *   **Zero-Waste I/O Pipeline:** Incoming TCP streams are parsed using a sliding index offset to completely eliminate redundant O(N) standard-library string shifts, requiring only a single buffer cleanup per epoll wake cycle. Furthermore, `epoll` event flags are passed directly to worker threads to eliminate redundant `read()` syscalls when the OS network buffer is simply draining (`EPOLLOUT`).
 *   **Robust Connection Management:** Safely handles notorious edge cases, including `EMFILE`/`ENFILE` descriptor exhaustion mitigation, 8MB maximum memory-payload defense, and lock-free O(1) eviction of idle clients using atomic timestamps.
 *   **Enterprise Observability:** Emits structured JSON logs natively formatted for seamless ingestion into log aggregation platforms like the ELK stack or Datadog.
