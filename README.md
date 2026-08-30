@@ -1,5 +1,5 @@
 # ReactorKV
-**Version: 0.7.0-alpha.1**
+**Version: 0.7.0-alpha.2**
 
 A highly concurrent, multithreaded in-memory key-value database written in modern C++17. Built from scratch to demonstrate low-level Linux system programming, this database features a Reactor/Worker network architecture, lock-striped memory partitions, and background asynchronous disk persistence.
 

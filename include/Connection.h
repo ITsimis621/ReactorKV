@@ -5,6 +5,7 @@
  * @brief Lock-free connection state management for the server's Object Pool.
  */
 
+#include <RingBuffer.h>
 #include <string>
 #include <atomic>
 #include <chrono>
@@ -20,8 +21,8 @@
  */
 struct Connection {
     int fd{-1};                                ///< The client's socket file descriptor
-    std::string read_buffer;                   ///< Unprocessed incoming TCP stream data
-    std::string write_buffer;                  ///< Queued outbound JSON responses
+    RingBuffer read_buffer;                    ///< Unprocessed incoming TCP stream data
+    RingBuffer write_buffer;                   ///< Queued outbound JSON responses
     std::atomic<uint64_t> last_active{0};      ///< Epoch timestamp for idle eviction
     std::atomic<bool> is_active{false};        ///< Lock-free flag indicating if slot is in use
     std::atomic<uint64_t> generation{0};       ///< ABA prevention counter to track connection lifecycles

@@ -53,8 +53,8 @@ class TestReactorKVIntegration(unittest.TestCase):
         Validates the server's ability to handle highly concurrent pipelined requests.
 
         Simulates multiple independent clients transmitting large batches of commands
-        without waiting for intermediate responses. This verifies the O(N) sliding 
-        offset buffer parsing and epoll event loop stability.
+        without waiting for intermediate responses. This verifies the O(1) circular
+        ring buffer extraction and modulo arithmetic and epoll event loop stability.
         
         Expected Outcome:
             All pipelined commands are parsed and responded to without data loss.
@@ -145,7 +145,7 @@ class TestReactorKVIntegration(unittest.TestCase):
         """
         Tests asynchronous flushing and EPOLLOUT re-arming logic.
         
-        Forces the server to allocate a 5MB response while intentionally shrinking
+        Forces the server to transmit a 32KB response while intentionally shrinking
         the client's OS TCP receive buffer. This triggers EAGAIN on the server side, 
         validating its ability to yield the thread and resume writing later.
 
@@ -157,7 +157,7 @@ class TestReactorKVIntegration(unittest.TestCase):
             s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
             s.connect((HOST, PORT))
             
-            massive_value = "A" * 5_000_000 
+            massive_value = "A" * 32_000
             
             # Upload
             set_payload = json.dumps({"command": "SET", "key": "heavy", "value": massive_value}).encode('utf-8') + b'\n'
@@ -177,7 +177,7 @@ class TestReactorKVIntegration(unittest.TestCase):
                 if b'\n' in chunk: 
                     break
                     
-            self.assertGreater(bytes_received, 5_000_000, "Failed to download complete payload.")
+            self.assertGreater(bytes_received, 32_000, "Failed to download complete payload.")
 
     def test_c10k_connection_hold(self):
         """
@@ -232,8 +232,8 @@ class TestReactorKVIntegration(unittest.TestCase):
         """
         Validates the server's defense against memory exhaustion attacks.
         
-        Sends a payload exceeding the 8MB MAX_PAYLOAD_SIZE to ensure the 
-        server safely drops the connection and returns the FATAL error.
+        Sends a payload exceeding the strictly allocated 64KB Ring Buffer capacity
+        to ensure the server safely drops the connection and returns the FATAL error.
 
         Expected Outcome:
             Server replies with a FATAL status and immediately closes the socket.
@@ -241,7 +241,7 @@ class TestReactorKVIntegration(unittest.TestCase):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.connect((HOST, PORT))
             
-            massive_string = "A" * 9_000_000 
+            massive_string = "A" * 70_000 
             try:
                 s.sendall(massive_string.encode('utf-8'))
             except (BrokenPipeError, ConnectionResetError):
@@ -251,7 +251,7 @@ class TestReactorKVIntegration(unittest.TestCase):
             response = s.recv(1024).decode('utf-8')
             
             self.assertIn("FATAL", response, "Server did not return a FATAL status.")
-            self.assertIn("Payload Too Large", response, "Server did not specify payload error.")
+            self.assertIn("64KB limit", response, "Server did not specify payload error.")
             
             chunk = s.recv(1024)
             self.assertEqual(len(chunk), 0, "Server left the socket open after a FATAL breach.")

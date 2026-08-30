@@ -44,7 +44,7 @@ private:
     bool stop_pool;                         ///< Flag to safely terminate all worker threads
 
     std::queue<std::tuple<int, uint64_t, uint32_t>> client_queue;          ///< Pending jobs representing sockets ready for I/O
-    std::array<Connection, MAX_CONNECTIONS> connection_pool;               ///< Statically allocated memory pool for client connections
+    std::vector<Connection> connection_pool;                               ///< Statically allocated memory pool for client connections
 
     /**
      * @brief Sets a socket file descriptor to non-blocking mode.

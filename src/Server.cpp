@@ -17,10 +17,14 @@ using json = nlohmann::json;
 
 constexpr int BUFFER_SIZE = 4096;
 constexpr int THREAD_POOL_SIZE = 10; 
-constexpr size_t MAX_PAYLOAD_SIZE = 8388608;
 
 Server::Server(int port, KVStore& db, int timeout_sec) 
-    : port(port), db(db), server_socket(-1), client_timeout_sec(timeout_sec), stop_pool(false) {
+    : port(port), 
+      db(db), 
+      server_socket(-1), 
+      client_timeout_sec(timeout_sec), 
+      stop_pool(false),
+      connection_pool(MAX_CONNECTIONS) {
     
     std::cout << format_log("INFO", "SYSTEM", "Initializing Database Engine on Port " + std::to_string(port) + "...") << std::endl;
 
@@ -246,24 +250,18 @@ void Server::handle_client(Connection& conn, uint32_t event_flags) {
             ssize_t bytes_read = read(conn.fd, temp, sizeof(temp));
             
             if (bytes_read > 0) {
-                conn.read_buffer.append(temp, bytes_read);
-                // Update atomic timestamp without acquiring global locks
-                conn.last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
-
-                if (conn.read_buffer.size() > MAX_PAYLOAD_SIZE) {
-                    std::cerr << format_log("ERROR", "SECURITY", "Client breached memory limit. Terminating connection.") << std::endl;
+                if (!conn.read_buffer.append(temp, bytes_read)) {
+                    std::cerr << format_log("ERROR", "SECURITY", "Client breached 64KB ring buffer limit.") << std::endl;
                     
-                    json error_json;
-                    error_json["status"] = "FATAL";
-                    error_json["message"] = "Payload Too Large. Maximum allowed size is 8MB.";
-                    std::string response = error_json.dump() + "\n";
-                    
-                    send(conn.fd, response.c_str(), response.length(), MSG_NOSIGNAL);
+                    std::string error_msg = "{\"level\":\"FATAL\",\"message\":\"Payload exceeds 64KB limit\"}\n";
+                    send(conn.fd, error_msg.c_str(), error_msg.length(), MSG_NOSIGNAL);
                     
                     conn.reset();
                     return;
                 }
+                
+                conn.last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
             }
             else if (bytes_read == 0) {
                 conn.reset();
@@ -284,12 +282,9 @@ void Server::handle_client(Connection& conn, uint32_t event_flags) {
             }
         }
 
-        size_t parse_offset = 0;
-        size_t pos;
+        std::string raw_message;
 
-        while ((pos = conn.read_buffer.find('\n', parse_offset)) != std::string::npos) {
-            std::string raw_message = conn.read_buffer.substr(parse_offset, pos - parse_offset);
-            parse_offset = pos + 1; 
+        while (conn.read_buffer.extract_line(raw_message)) {
             
             json response_json;
             try {
@@ -344,46 +339,48 @@ void Server::handle_client(Connection& conn, uint32_t event_flags) {
                 std::cerr << format_log("WARN", "SYSTEM", "Received malformed JSON from client.") << std::endl;
             }
 
-            conn.write_buffer += response_json.dump() + "\n";
-        }
-
-        if (parse_offset > 0) {
-            conn.read_buffer.erase(0, parse_offset);
+            std::string response_str = response_json.dump() + "\n";
+            if (!conn.write_buffer.append(response_str.c_str(), response_str.length())) {
+                std::cerr << format_log("ERROR", "NETWORK", "Write buffer overflow.") << std::endl;
+                conn.reset();
+                return;
+            }
         }
     }
 
     // Bypass read loop and jump straight to flushing if OS TCP buffer just drained (EPOLLOUT)
-    if ((event_flags & EPOLLOUT) || !conn.write_buffer.empty()) {
-        ssize_t total_sent = 0;
-        
-        while (total_sent < static_cast<ssize_t>(conn.write_buffer.length())) {
-            ssize_t bytes_sent = send(conn.fd, conn.write_buffer.c_str() + total_sent, 
-                                    conn.write_buffer.length() - total_sent, MSG_NOSIGNAL);
+    if ((event_flags & EPOLLOUT) || !conn.write_buffer.is_empty()) {
+
+        bool data_sent = false;
+
+        while (!conn.write_buffer.is_empty()) {
+            const char* chunk_ptr = nullptr;
+            size_t chunk_len = conn.write_buffer.get_contiguous_read_chunk(chunk_ptr);
+
+            ssize_t bytes_sent = send(conn.fd, chunk_ptr, chunk_len, MSG_NOSIGNAL);
             
             if (bytes_sent == -1) {
                 if (errno == EINTR) continue; 
-                
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    break; 
-                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
 
                 std::cerr << format_log("WARN", "NETWORK", "Client disconnected during write.") << std::endl;
                 conn.reset();
                 return; 
             }
-            total_sent += bytes_sent;
-        }
 
-        if (total_sent > 0) {
-            conn.write_buffer.erase(0, total_sent);
+            conn.write_buffer.consume(bytes_sent);
+            data_sent = true;
+        }
+            
+        if (data_sent) {
             conn.last_active.store(std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count(), std::memory_order_relaxed);
-        }
+        } 
     }
 
     struct epoll_event event;
     
-    if (!conn.write_buffer.empty()) {
+    if (!conn.write_buffer.is_empty()) {
         // Buffer is full (EAGAIN hit). Re-arm with EPOLLOUT to wait for OS TCP buffer to drain.
         event.events = EPOLLIN | EPOLLOUT | EPOLLONESHOT;
     } else {
